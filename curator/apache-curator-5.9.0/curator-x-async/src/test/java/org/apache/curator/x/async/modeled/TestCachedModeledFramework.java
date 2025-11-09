@@ -1,0 +1,411 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.curator.x.async.modeled;
+
+import static org.junit.jupiter.api.Assertions.*;
+import com.google.common.collect.Sets;
+import java.io.IOException;
+import java.math.BigInteger;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.apache.curator.framework.state.ConnectionState;
+import org.apache.curator.test.Timing;
+import org.apache.curator.test.compatibility.CuratorTestBase;
+import org.apache.curator.x.async.AsyncStage;
+import org.apache.curator.x.async.modeled.cached.CachedModeledFramework;
+import org.apache.curator.x.async.modeled.cached.ModeledCacheListener;
+import org.apache.curator.x.async.modeled.models.TestModel;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.data.Stat;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+@Tag(CuratorTestBase.zk35TestCompatibilityGroup)
+public class TestCachedModeledFramework extends TestModeledFrameworkBase {
+    @Test
+    public void testDownServer() throws IOException {
+        Timing timing = new Timing();
+
+        TestModel model = new TestModel("a", "b", "c", 1, BigInteger.ONE);
+        CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached();
+        Semaphore semaphore = new Semaphore(0);
+        client.listenable().addListener((t, p, s, m) -> semaphore.release());
+
+        client.start();
+        try {
+            client.child(model).set(model);
+            assertTrue(timing.acquireSemaphore(semaphore));
+
+            CountDownLatch latch = new CountDownLatch(1);
+            rawClient.getConnectionStateListenable().addListener((__, state) -> {
+                if (state == ConnectionState.LOST) {
+                    latch.countDown();
+                }
+            });
+            server.stop();
+            assertTrue(timing.awaitLatch(latch));
+
+            complete(client.child(model).read().whenComplete((value, e) -> {
+                assertNotNull(value);
+                assertNull(e);
+            }));
+            complete(client.child(model).checkExists().whenComplete((value, e) -> {
+                assertNotNull(value);
+                assertNull(e);
+            }));
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    public void testPostInitializedFilter() {
+        TestModel model1 = new TestModel("a", "b", "c", 1, BigInteger.ONE);
+        TestModel model2 = new TestModel("d", "e", "f", 1, BigInteger.ONE);
+        CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached();
+        Semaphore semaphore = new Semaphore(0);
+        ModeledCacheListener<TestModel> listener = (t, p, s, m) -> semaphore.release();
+        client.listenable().addListener(listener.postInitializedOnly());
+
+        complete(client.child("1").set(model1)); // set before cache is started
+        client.start();
+        try {
+            assertFalse(timing.forSleepingABit().acquireSemaphore(semaphore));
+
+            client.child("2").set(model2); // set before cache is started
+            assertTrue(timing.acquireSemaphore(semaphore));
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    public void testChildren() {
+        TestModel parent = new TestModel("a", "b", "c", 20, BigInteger.ONE);
+        TestModel child1 = new TestModel("d", "e", "f", 1, BigInteger.ONE);
+        TestModel child2 = new TestModel("g", "h", "i", 1, BigInteger.ONE);
+        TestModel grandChild1 = new TestModel("j", "k", "l", 10, BigInteger.ONE);
+        TestModel grandChild2 = new TestModel("m", "n", "0", 5, BigInteger.ONE);
+
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            CountDownLatch latch = new CountDownLatch(5);
+            client.listenable().addListener((t, p, s, m) -> latch.countDown());
+
+            client.start();
+            complete(client.child("p").set(parent));
+            complete(client.child("p").child("c1").set(child1));
+            complete(client.child("p").child("c2").set(child2));
+            complete(client.child("p").child("c1").child("g1").set(grandChild1));
+            complete(client.child("p").child("c2").child("g2").set(grandChild2));
+            assertTrue(timing.awaitLatch(latch));
+
+            complete(client.child("p").children(), (v, e) -> {
+                List<ZPath> paths = Arrays.asList(
+                        client.child("p").child("c1").modelSpec().path(),
+                        client.child("p").child("c2").modelSpec().path());
+                assertEquals(v, paths);
+            });
+
+            complete(client.child("p").childrenAsZNodes(), (v, e) -> {
+                Set<TestModel> cachedModels = toSet(v.stream(), ZNode::model);
+                assertEquals(cachedModels, Sets.newHashSet(child1, child2));
+
+                // verify that the same nodes are returned from the uncached method
+                complete(ModeledFramework.wrap(async, modelSpec).child("p").childrenAsZNodes(), (v2, e2) -> {
+                    Set<TestModel> uncachedModels = toSet(v2.stream(), ZNode::model);
+                    assertEquals(cachedModels, uncachedModels);
+                });
+            });
+
+            complete(
+                    client.child("p").childrenAsZNodes(),
+                    (v, e) -> assertEquals(toSet(v.stream(), ZNode::model), Sets.newHashSet(child1, child2)));
+            complete(
+                    client.withPath(ZPath.from(path, "p")).childrenAsZNodes(),
+                    (v, e) -> assertEquals(toSet(v.stream(), ZNode::model), Sets.newHashSet(child1, child2)));
+            complete(
+                    client.child("p").child("c1").childrenAsZNodes(),
+                    (v, e) -> assertEquals(toSet(v.stream(), ZNode::model), Sets.newHashSet(grandChild1)));
+            complete(
+                    client.child("p").child("c2").childrenAsZNodes(),
+                    (v, e) -> assertEquals(toSet(v.stream(), ZNode::model), Sets.newHashSet(grandChild2)));
+
+            complete(
+                    client.child("p").child("c1").list(),
+                    (v, e) -> assertEquals(
+                            toSet(v.stream(), Function.identity()),
+                            Sets.newHashSet(parent, child1, child2, grandChild1, grandChild2)));
+            complete(
+                    client.child("p").child("c2").list(),
+                    (v, e) -> assertEquals(
+                            toSet(v.stream(), Function.identity()),
+                            Sets.newHashSet(parent, child1, child2, grandChild1, grandChild2)));
+            complete(
+                    client.child("p").list(),
+                    (v, e) -> assertEquals(
+                            toSet(v.stream(), Function.identity()),
+                            Sets.newHashSet(parent, child1, child2, grandChild1, grandChild2)));
+            complete(
+                    client.child("p").child("c2").child("g2").list(),
+                    (v, e) -> assertEquals(
+                            toSet(v.stream(), Function.identity()),
+                            Sets.newHashSet(parent, child1, child2, grandChild1, grandChild2)));
+        }
+
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec.withPath(ZPath.root)).cached()) {
+            client.start();
+            complete(
+                    client.list(),
+                    (v, e) -> assertEquals(
+                            toSet(v.stream(), Function.identity()),
+                            Sets.newHashSet(parent, child1, child2, grandChild1, grandChild2)));
+        }
+    }
+
+    // note: CURATOR-546
+    @Test
+    public void testAccessCacheDirectly() {
+        TestModel model = new TestModel("a", "b", "c", 20, BigInteger.ONE);
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            CountDownLatch latch = new CountDownLatch(1);
+            client.listenable().addListener((t, p, s, m) -> latch.countDown());
+
+            client.start();
+            complete(client.child("m").set(model));
+            assertTrue(timing.awaitLatch(latch));
+
+            // call 2 times in a row to validate CURATOR-546
+            Optional<ZNode<TestModel>> optZNode =
+                    client.cache().currentData(modelSpec.path().child("m"));
+            assertEquals(
+                    optZNode.orElseThrow(() -> new AssertionError("node is missing"))
+                            .model(),
+                    model);
+            optZNode = client.cache().currentData(modelSpec.path().child("m"));
+            assertEquals(
+                    optZNode.orElseThrow(() -> new AssertionError("node is missing"))
+                            .model(),
+                    model);
+        }
+    }
+
+    // Verify the CachedModeledFramework does not attempt to deserialize empty ZNodes on deletion using the Jackson
+    // model serializer.
+    // See: CURATOR-609
+    @Test
+    public void testEmptyNodeJacksonDeserialization() {
+        final TestModel model = new TestModel("a", "b", "c", 20, BigInteger.ONE);
+        verifyEmptyNodeDeserialization(model, modelSpec);
+    }
+
+    // Verify the CachedModeledFramework does not attempt to deserialize empty ZNodes on deletion using the raw
+    // model serializer.
+    // See: CURATOR-609
+    @Test
+    public void testEmptyNodeRawDeserialization() {
+        final byte[] byteModel = {0x01, 0x02, 0x03};
+        final ModelSpec<byte[]> byteModelSpec =
+                ModelSpec.builder(path, ModelSerializer.raw).build();
+        verifyEmptyNodeDeserialization(byteModel, byteModelSpec);
+    }
+
+    @Test
+    void testInitializedCachedModeledFramework() throws ExecutionException, InterruptedException, TimeoutException {
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            TestModel model = new TestModel("a", "b", "c", 1, BigInteger.ONE);
+            assertNotNull(timing.getFuture(client.set(model).toCompletableFuture()));
+            AsyncStage<TestModel> asyncModel = client.read();
+            client.start();
+            assertEquals(model, timing.getFuture(asyncModel.toCompletableFuture()));
+        }
+    }
+
+    @Test
+    void testNoNodeException() throws InterruptedException, TimeoutException {
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            AsyncStage<TestModel> asyncModel = client.read();
+            client.start();
+            try {
+                timing.getFuture(asyncModel.toCompletableFuture());
+                fail("This test should result in a NoNodeException");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof KeeperException.NoNodeException);
+            }
+
+            complete(client.checkExists().whenComplete((value, e) -> {
+                assertNull(value);
+                assertNull(e);
+            }));
+        }
+    }
+
+    @Test
+    void testRead() throws InterruptedException, TimeoutException, ExecutionException {
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            TestModel model = new TestModel("a", "b", "c", 1, BigInteger.ONE);
+            assertNotNull(timing.getFuture(client.set(model).toCompletableFuture()));
+            client.start();
+            assertEquals(model, timing.getFuture(client.read().toCompletableFuture()));
+            assertEquals(
+                    model,
+                    timing.getFuture(client.readAsZNode().toCompletableFuture()).model());
+            Stat stat = new Stat();
+            assertEquals(model, timing.getFuture(client.read(stat).toCompletableFuture()));
+            assertTrue(stat.getDataLength() > 0);
+        }
+    }
+
+    @Test
+    void testReadThrough() throws InterruptedException, TimeoutException, ExecutionException {
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            TestModel model = new TestModel("a", "b", "c", 1, BigInteger.ONE);
+            Semaphore semaphore = new Semaphore(0);
+            client.listenable().addListener(new ModeledCacheListener<TestModel>() {
+                @Override
+                public void accept(Type type, ZPath path, Stat stat, TestModel model) {
+                    // NOP
+                }
+
+                @Override
+                public void initialized() {
+                    semaphore.release();
+                }
+            });
+            client.start();
+            assertTrue(timing.acquireSemaphore(semaphore));
+            assertNotNull(timing.getFuture(client.set(model).toCompletableFuture()));
+            Stat stat = new Stat();
+            assertEquals(model, timing.getFuture(client.readThrough(stat).toCompletableFuture()));
+            assertTrue(stat.getDataLength() > 0);
+            assertEquals(
+                    model,
+                    timing.getFuture(client.readThroughAsZNode().toCompletableFuture())
+                            .model());
+            assertEquals(model, timing.getFuture(client.readThrough().toCompletableFuture()));
+        }
+    }
+
+    @Test
+    void testReadThroughFailure() throws InterruptedException, TimeoutException, ExecutionException {
+        try (CachedModeledFramework<TestModel> client =
+                ModeledFramework.wrap(async, modelSpec).cached()) {
+            client.start();
+            assertNull(timing.getFuture(client.delete().toCompletableFuture()));
+            complete(client.readThrough(), (d, e) -> {
+                if (e == null) {
+                    fail("This test should result in a NoNodeException");
+                } else {
+                    assertEquals(KeeperException.NoNodeException.class, e.getClass());
+                }
+            });
+        }
+    }
+
+    private <T> void verifyEmptyNodeDeserialization(T model, ModelSpec<T> parentModelSpec) {
+        // The sub-path is the ZNode that will be removed that does not contain any model data. Their should be no
+        // attempt to deserialize this empty ZNode.
+        final String subPath = parentModelSpec.path().toString() + "/sub";
+
+        final String testModelPath = subPath + "/test";
+        final String signalModelPath = subPath + "/signal";
+
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        final AtomicBoolean modelWasNull = new AtomicBoolean(false);
+        final AtomicReference<Exception> caughtHandleException = new AtomicReference<>(null);
+
+        // Create a custom listener to signal the end of the test and ensure that nothing is thrown.
+        final ModeledCacheListener<T> listener = new ModeledCacheListener<T>() {
+            @Override
+            public void accept(Type t, ZPath p, Stat s, T m) {
+                // We don't expect the handler to be called with a null model.
+                if (m == null) {
+                    modelWasNull.set(true);
+                }
+
+                if (t == ModeledCacheListener.Type.NODE_ADDED && p.toString().equals(signalModelPath)) {
+                    latch.countDown();
+                }
+            }
+
+            public void handleException(Exception e) {
+                caughtHandleException.set(e);
+            }
+        };
+
+        final ModelSerializer<T> serializer = parentModelSpec.serializer();
+
+        // Create a cache client to watch the parent path.
+        try (CachedModeledFramework<T> cacheClient =
+                ModeledFramework.wrap(async, parentModelSpec).cached()) {
+            cacheClient.listenable().addListener(listener);
+
+            ModelSpec<T> testModelSpec =
+                    ModelSpec.builder(ZPath.parse(testModelPath), serializer).build();
+            ModeledFramework<T> testModelClient = ModeledFramework.wrap(async, testModelSpec);
+
+            ModelSpec<T> signalModelSpec =
+                    ModelSpec.builder(ZPath.parse(signalModelPath), serializer).build();
+            ModeledFramework<T> signalModelClient = ModeledFramework.wrap(async, signalModelSpec);
+
+            cacheClient.start();
+
+            // Create the test model (with sub-path), creating the initial parent path structure.
+            complete(testModelClient.set(model));
+
+            // Delete the test model, then delete the sub-path. As the sub-path ZNode is empty, we expect that this
+            // should not throw an exception.
+            complete(testModelClient.delete());
+            complete(testModelClient.unwrap().delete().forPath(subPath));
+
+            // Finally, create the signal model purely to signal the end of the test.
+            complete(signalModelClient.set(model));
+
+            assertTrue(timing.awaitLatch(latch));
+
+            assertFalse(modelWasNull.get(), "Listener should never be called with a null model");
+            assertNull(caughtHandleException.get(), "Exception should not have been handled by listener");
+        }
+    }
+
+    private <T, R> Set<R> toSet(Stream<T> stream, Function<? super T, ? extends R> mapper) {
+        return stream.map(mapper).collect(Collectors.toSet());
+    }
+}
