@@ -48,7 +48,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     // --- (FIX) 持久化的备节点连接 ---
     private volatile String backupAddress = null; // "host:port" of backup
     private KeyValueService.Client backupClient = null; // 持久化的 Thrift 客户端
-    private TTransport backupTransport = null;      // 对应的 Transport
+    private TTransport backupTransport = null;       // 对应的 Transport
 
 
 
@@ -71,7 +71,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      * 由 StorageNode 在 znode 创建后调用
      */
     public void initialize() {
-        log.info("Handler initialized. My znode is: " + myZnodePath);
+        // log.info("Handler initialized. My znode is: " + myZnodePath);
         // 第一次确定角色并设置 watch
         determineRole();
     }
@@ -88,7 +88,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             Collections.sort(children); // 按字典序排序
 
             if (children.isEmpty() || myZnodePath == null || !children.contains(myZnodePath.substring(zkNode.length() + 1))) {
-                log.warn("My znode is not in children list or list is empty.");
+                // log.warn("My znode is not in children list or list is empty.");
                 isPrimary = false;
                 closeBackupConnection(); // (FIX) 清理旧的备节点连接
                 return;
@@ -102,9 +102,9 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             if (myZnodePath.equals(primaryFullPath)) {
                 // --- 我是 Primary ---
                 isPrimary = true;
-                if (!wasPrimary) {
-                    log.info("====== Transitioned to PRIMARY role ======");
-                }
+                // if (!wasPrimary) {
+                //     // log.info("====== Transitioned to PRIMARY role ======");
+                // }
 
                 // (FIX) 查找并管理到 Backup 的持久连接
                 String newBackupAddress = null;
@@ -115,14 +115,14 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                         byte[] data = curClient.getData().forPath(backupFullPath);
                         newBackupAddress = new String(data);
                     } catch (Exception e) {
-                        log.warn("Failed to get backup address, assuming no backup.", e);
+                        // log.warn("Failed to get backup address, assuming no backup.", e);
                         newBackupAddress = null;
                     }
                 }
 
                 // 检查备节点是否已更改
                 if (newBackupAddress == null || !newBackupAddress.equals(this.backupAddress)) {
-                    log.info("Backup changed (or removed). Old: " + this.backupAddress + ", New: " + newBackupAddress);
+                    // log.info("Backup changed (or removed). Old: " + this.backupAddress + ", New: " + newBackupAddress);
                     closeBackupConnection(); // 清理旧连接
                     if (newBackupAddress != null) {
                         // 创建并保存新连接
@@ -136,7 +136,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                 closeBackupConnection(); // (FIX) Backup 不需要备节点连接
 
                 if (wasPrimary) {
-                    log.info("====== Transitioned to BACKUP role ======");
+                    // log.info("====== Transitioned to BACKUP role ======");
                 }
 
                 // Step 6 / Scenario #1: 如果我是 Backup 且未初始化数据, 执行状态转移
@@ -144,18 +144,18 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                     try {
                         byte[] data = curClient.getData().forPath(primaryFullPath);
                         String primaryAddress = new String(data);
-                        log.info("Performing state transfer from primary at " + primaryAddress);
+                        // log.info("Performing state transfer from primary at " + primaryAddress);
                         performStateTransfer(primaryAddress);
                         dataInitialized = true; // 标记为已初始化
                     } catch (Exception e) {
-                        log.error("Failed to perform initial state transfer", e);
+                        // log.error("Failed to perform initial state transfer", e);
                         // 将保持未初始化状态，下次 watch 触发时重试
                     }
                 }
             }
 
         } catch (Exception e) {
-            log.error("Failed to determine role", e);
+            // log.error("Failed to determine role", e);
             isPrimary = false; // 出错时, 假定为 backup
             closeBackupConnection();
         } finally {
@@ -168,7 +168,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      */
     @Override
     public void process(WatchedEvent event) throws Exception {
-        log.warn("ZooKeeper watch triggered: " + event.getType());
+        // log.warn("ZooKeeper watch triggered: " + event.getType());
 
         // Znode 列表发生变化 (服务器崩溃或加入)
         // 重新运行角色确定逻辑
@@ -179,49 +179,36 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
     @Override
     public String get(String key) throws org.apache.thrift.TException {
-        // Step 5: 检查角色 (Scenario #3)
+        // Step 5: 检查角色 (Scenario #3) 读操作不应该上锁
         if (!isPrimary) {
-            log.warn("Received GET request, but I am not primary. Throwing exception.");
+            // log.warn("Received GET request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve get requests.");
         }
-
-        // Step 5: Concurrency Control
-        dataLock.lock();
-        try {
-            log.info("Primary: GET " + key);
-            String ret = myMap.get(key);
-            if (ret == null)
-                return "";
-            else
-                return ret;
-        } finally {
-            dataLock.unlock();
-        }
+        return myMap.getOrDefault(key, "");
     }
 
     @Override
     public void put(String key, String value) throws org.apache.thrift.TException {
         // Step 5: 检查角色 (Scenario #3)
         if (!isPrimary) {
-            log.warn("Received PUT request, but I am not primary. Throwing exception.");
+            // log.warn("Received PUT request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve put requests.");
         }
-
         // Step 5: Concurrency Control
         dataLock.lock();
         try {
-            log.info("Primary: PUT " + key + "=" + value);
+            // log.info("Primary: PUT " + key + "=" + value);
 
             // (FIX) Step 5: 使用持久连接同步复制到 Backup
             if (this.backupClient != null) {
-                log.debug("Replicating PUT to backup: " + this.backupAddress);
+                // log.debug("Replicating PUT to backup: " + this.backupAddress);
                 try {
                     // (FIX) 重用持久化的客户端
                     this.backupClient.backupPut(key, value);
-                    log.debug("Replication successful.");
+                    // log.debug("Replication successful.");
 
                 } catch (TException e) {
-                    log.warn("Replication to backup failed. Assuming backup is down.", e);
+                    // log.warn("Replication to backup failed. Assuming backup is down.", e);
                     // 复制失败. 假定 backup 已崩溃.
                     // 清理坏的连接. 下次 ZK watch 触发时 'determineRole' 会找到新备节点.
                     closeBackupConnection();
@@ -243,13 +230,13 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     @Override
     public void backupPut(String key, String value) throws TException {
         // 这个方法 *不* 检查 isPrimary
-        dataLock.lock();
-        try {
-            log.info("Backup: Replicating PUT " + key + "=" + value);
-            myMap.put(key, value);
-        } finally {
-            dataLock.unlock();
-        }
+        //dataLock.lock();
+        //try {
+        // log.info("Backup: Replicating PUT " + key + "=" + value);
+        myMap.put(key, value);
+        //} finally {
+        //    dataLock.unlock();
+        //}
     }
 
     /**
@@ -259,16 +246,17 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     @Override
     public Map<String, String> getFullDataSet() throws TException {
         if (!isPrimary) {
-            log.warn("Received getFullDataSet request, but I am not primary.");
-            throw new TException("Not the primary. Cannot serve full data set.");
+            // log.warn("Received getFullDataSet request, but I am not primary.");
+            // throw new TException("Not the primary. Cannot serve full data set.");
         }
 
         dataLock.lock();
         try {
-            log.info("Primary: Serving full data set to new backup.");
+            // log.info("Primary: Serving full data set to new backup.");
             // 返回一个 *副本* 以确保线程安全
             // 返回新的map是否会增加开销？！
-            return new HashMap<>(myMap);
+            // return new HashMap<>(myMap);
+            return myMap;
         } finally {
             dataLock.unlock();
         }
@@ -291,13 +279,16 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             primaryClient = new KeyValueService.Client(protocol);
 
             // 调用在 a3.thrift 中新定义的 'getFullDataSet'
-            Map<String, String> data = primaryClient.getFullDataSet();
-            //myMap.clear();myMap.putAll(data);是否会增加开销？! 能不能直接赋值？!
+            myMap = primaryClient.getFullDataSet(); // FIX: 声明局部变量 'data'
+
             // 已持有 dataLock (在 determineRole 中)
-            log.info("State transfer: Received " + data.size() + " items from primary.");
-            myMap.clear();
-            myMap.putAll(data);
-            log.info("State transfer complete.");
+            // log.info("State transfer: Received " + data.size() + " items from primary.");
+
+            // FIX: 覆盖 myMap 的内容以完成状态转移
+            //myMap.clear();
+            //myMap.putAll(data);
+
+            // log.info("State transfer complete.");
 
         } finally {
             if (primaryTransport != null) {
@@ -320,9 +311,9 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             TProtocol protocol = new TBinaryProtocol(this.backupTransport);
             this.backupClient = new KeyValueService.Client(protocol);
             this.backupAddress = hostPort; // 存储当前连接的地址
-            log.info("Created persistent connection to backup at " + hostPort);
+            // log.info("Created persistent connection to backup at " + hostPort);
         } catch (TException e) {
-            log.warn("Failed to create persistent connection to backup: " + e.getMessage());
+            // log.warn("Failed to create persistent connection to backup: " + e.getMessage());
             this.backupClient = null;
             this.backupTransport = null;
             this.backupAddress = null;
@@ -334,7 +325,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      */
     private void closeBackupConnection() {
         if (this.backupTransport != null) {
-            log.info("Closing persistent connection to backup at " + this.backupAddress);
+            // log.info("Closing persistent connection to backup at " + this.backupAddress);
             this.backupTransport.close();
         }
         this.backupClient = null;
