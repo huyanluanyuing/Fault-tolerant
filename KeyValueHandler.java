@@ -16,7 +16,16 @@ import org.apache.curator.framework.api.CuratorWatcher; // 导入 Watcher
 
 import org.apache.log4j.*;
 
-
+/**
+ * 实现了 Step 5 & 6 逻辑的 KeyValueHandler.
+ * * !!! 重要 !!!
+ * 编译此文件前, 您必须:
+ * 1. 打开 'a3.thrift'
+ * 2. 在 'service KeyValueService' 中添加:
+ * void backupPut(1:string key, 2:string value)
+ * map<string, string> getFullDataSet()
+ * 3. 运行 'thrift --gen java a3.thrift' 来重新生成 gen-java
+ */
 public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
     static Logger log = Logger.getLogger(KeyValueHandler.class.getName());
@@ -33,9 +42,14 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     private String myZnodePath; // This server's full ZK path
 
     // --- Role & State Variables ---
-    private volatile boolean isPrimary = false; // if the node is primary
+    private volatile boolean isPrimary = false;
     private volatile boolean dataInitialized = false; // 用于 Scenario #1 状态转移
+
+    // --- (FIX) 持久化的备节点连接 ---
     private volatile String backupAddress = null; // "host:port" of backup
+    private KeyValueService.Client backupClient = null; // 持久化的 Thrift 客户端
+    private TTransport backupTransport = null;      // 对应的 Transport
+
 
 
     public KeyValueHandler(String host, int port, CuratorFramework curClient, String zkNode) {
@@ -76,7 +90,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             if (children.isEmpty() || myZnodePath == null || !children.contains(myZnodePath.substring(zkNode.length() + 1))) {
                 log.warn("My znode is not in children list or list is empty.");
                 isPrimary = false;
-                backupAddress = null;
+                closeBackupConnection(); // (FIX) 清理旧的备节点连接
                 return;
             }
 
@@ -92,26 +106,35 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                     log.info("====== Transitioned to PRIMARY role ======");
                 }
 
-                // 查找 Backup (列表中的第二个)
+                // (FIX) 查找并管理到 Backup 的持久连接
+                String newBackupAddress = null;
                 if (children.size() > 1) {
                     String backupZnodeName = children.get(1);
                     String backupFullPath = zkNode + "/" + backupZnodeName;
                     try {
                         byte[] data = curClient.getData().forPath(backupFullPath);
-                        backupAddress = new String(data);
-                        log.info("Found backup at: " + backupAddress);
+                        newBackupAddress = new String(data);
                     } catch (Exception e) {
                         log.warn("Failed to get backup address, assuming no backup.", e);
-                        backupAddress = null;
+                        newBackupAddress = null;
                     }
-                } else {
-                    backupAddress = null; // 没有 backup
+                }
+
+                // 检查备节点是否已更改
+                if (newBackupAddress == null || !newBackupAddress.equals(this.backupAddress)) {
+                    log.info("Backup changed (or removed). Old: " + this.backupAddress + ", New: " + newBackupAddress);
+                    closeBackupConnection(); // 清理旧连接
+                    if (newBackupAddress != null) {
+                        // 创建并保存新连接
+                        createBackupConnection(newBackupAddress);
+                    }
                 }
 
             } else {
                 // --- 我是 Backup ---
                 isPrimary = false;
-                backupAddress = null;
+                closeBackupConnection(); // (FIX) Backup 不需要备节点连接
+
                 if (wasPrimary) {
                     log.info("====== Transitioned to BACKUP role ======");
                 }
@@ -122,7 +145,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                         byte[] data = curClient.getData().forPath(primaryFullPath);
                         String primaryAddress = new String(data);
                         log.info("Performing state transfer from primary at " + primaryAddress);
-                        performStateTransfer(primaryAddress);// get all data from primary
+                        performStateTransfer(primaryAddress);
                         dataInitialized = true; // 标记为已初始化
                     } catch (Exception e) {
                         log.error("Failed to perform initial state transfer", e);
@@ -134,7 +157,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
         } catch (Exception e) {
             log.error("Failed to determine role", e);
             isPrimary = false; // 出错时, 假定为 backup
-            backupAddress = null;
+            closeBackupConnection();
         } finally {
             dataLock.unlock();
         }
@@ -189,25 +212,19 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
         try {
             log.info("Primary: PUT " + key + "=" + value);
 
-            // Step 5: 同步复制到 Backup
-            if (backupAddress != null) {
-                log.debug("Replicating PUT to backup: " + backupAddress);
+            // (FIX) Step 5: 使用持久连接同步复制到 Backup
+            if (this.backupClient != null) {
+                log.debug("Replicating PUT to backup: " + this.backupAddress);
                 try {
-                    // 每一次新建一个连接并关闭连接可能会降低吞吐量?!
-                    // (此辅助方法在下面定义)
-                    KeyValueService.Client backupClient = createThriftClient(backupAddress);
-
-                    // 调用在 a3.thrift 中新定义的 'backupPut'
-                    backupClient.backupPut(key, value);
-
+                    // (FIX) 重用持久化的客户端
+                    this.backupClient.backupPut(key, value);
                     log.debug("Replication successful.");
 
-                    closeThriftClient(backupClient);
                 } catch (TException e) {
                     log.warn("Replication to backup failed. Assuming backup is down.", e);
-                    // 复制失败. 暂时假定 backup 已崩溃.
-                    // 下次 ZK watch 触发时 'determineRole' 会更新 backupAddress.
-                    backupAddress = null;
+                    // 复制失败. 假定 backup 已崩溃.
+                    // 清理坏的连接. 下次 ZK watch 触发时 'determineRole' 会找到新备节点.
+                    closeBackupConnection();
                 }
             }
             // 先更新本地还是远程？！
@@ -225,7 +242,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      */
     @Override
     public void backupPut(String key, String value) throws TException {
-        // 这个方法 不检查 isPrimary
+        // 这个方法 *不* 检查 isPrimary
         dataLock.lock();
         try {
             log.info("Backup: Replicating PUT " + key + "=" + value);
@@ -264,54 +281,64 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      */
     private void performStateTransfer(String primaryAddress) throws TException {
         KeyValueService.Client primaryClient = null;
+        TTransport primaryTransport = null;
         try {
-            primaryClient = createThriftClient(primaryAddress);
+            // (FIX) 使用局部变量，因为这个连接只在状态转移时使用一次
+            String[] parts = primaryAddress.split(":");
+            primaryTransport = new TFramedTransport(new TSocket(parts[0], Integer.parseInt(parts[1])));
+            primaryTransport.open();
+            TProtocol protocol = new TBinaryProtocol(primaryTransport);
+            primaryClient = new KeyValueService.Client(protocol);
 
             // 调用在 a3.thrift 中新定义的 'getFullDataSet'
             Map<String, String> data = primaryClient.getFullDataSet();
-
+            //myMap.clear();myMap.putAll(data);是否会增加开销？! 能不能直接赋值？!
             // 已持有 dataLock (在 determineRole 中)
-            //myMap.clear();myMap.putAll(data);是否会增加开销？
             log.info("State transfer: Received " + data.size() + " items from primary.");
             myMap.clear();
             myMap.putAll(data);
             log.info("State transfer complete.");
 
         } finally {
-            if (primaryClient != null) {
-                closeThriftClient(primaryClient);
+            if (primaryTransport != null) {
+                primaryTransport.close();
             }
         }
     }
 
     /**
-     * 创建一个到另一台服务器的 Thrift 客户端连接
+     * (FIX) 创建一个到备节点的持久 Thrift 客户端连接
      */
-    private KeyValueService.Client createThriftClient(String hostPort) throws TException {
-        String[] parts = hostPort.split(":");
-        String host = parts[0];
-        int port = Integer.parseInt(parts[1]);
+    private void createBackupConnection(String hostPort) {
+        try {
+            String[] parts = hostPort.split(":");
+            String host = parts[0];
+            int port = Integer.parseInt(parts[1]);
 
-        TSocket sock = new TSocket(host, port);
-        TTransport transport = new TFramedTransport(sock);
-        transport.open();
-        TProtocol protocol = new TBinaryProtocol(transport);
-        return new KeyValueService.Client(protocol);
+            this.backupTransport = new TFramedTransport(new TSocket(host, port));
+            this.backupTransport.open();
+            TProtocol protocol = new TBinaryProtocol(this.backupTransport);
+            this.backupClient = new KeyValueService.Client(protocol);
+            this.backupAddress = hostPort; // 存储当前连接的地址
+            log.info("Created persistent connection to backup at " + hostPort);
+        } catch (TException e) {
+            log.warn("Failed to create persistent connection to backup: " + e.getMessage());
+            this.backupClient = null;
+            this.backupTransport = null;
+            this.backupAddress = null;
+        }
     }
 
     /**
-     * 关闭 Thrift 客户端连接
+     * (FIX) 关闭并清理到备节点的持久连接
      */
-    private void closeThriftClient(KeyValueService.Client client) {
-        try {
-            client.getInputProtocol().getTransport().close();
-        } catch (Exception e) {
-            // ignore
+    private void closeBackupConnection() {
+        if (this.backupTransport != null) {
+            log.info("Closing persistent connection to backup at " + this.backupAddress);
+            this.backupTransport.close();
         }
-        try {
-            client.getOutputProtocol().getTransport().close();
-        } catch (Exception e) {
-            // ignore
-        }
+        this.backupClient = null;
+        this.backupTransport = null;
+        this.backupAddress = null;
     }
 }
