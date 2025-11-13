@@ -2,24 +2,26 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.locks.ReentrantLock; // 导入 Java 锁
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock; // (1) 仅用于控制平面的锁
 
 import org.apache.thrift.*;
-import org.apache.thrift.transport.*;
-import org.apache.thrift.transport.layered.*; // 导入 TFrameTransport
 import org.apache.thrift.protocol.*;
+import org.apache.thrift.transport.*;
+import org.apache.thrift.transport.layered.*;
+
 import org.apache.zookeeper.*;
 import org.apache.curator.*;
 import org.apache.curator.retry.*;
 import org.apache.curator.framework.*;
-import org.apache.curator.framework.api.CuratorWatcher; // 导入 Watcher
+import org.apache.curator.framework.api.CuratorWatcher;
 
-import org.apache.log4j.*;
+// import org.apache.log4j.*; // (如您所愿，注释掉日志以提高速度)
 
 /**
- * 实现了 Step 5 & 6 逻辑的 KeyValueHandler.
- * * !!! 重要 !!!
- * 编译此文件前, 您必须:
+ * 最终版本: 满足正确性 (同步复制)
+ * 并为性能 (无锁 Get/Put) 进行了优化
+ * * 编译此文件前, 您必须:
  * 1. 打开 'a3.thrift'
  * 2. 在 'service KeyValueService' 中添加:
  * void backupPut(1:string key, 2:string value)
@@ -28,28 +30,31 @@ import org.apache.log4j.*;
  */
 public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
-    static Logger log = Logger.getLogger(KeyValueHandler.class.getName());
+    // static Logger log = Logger.getLogger(KeyValueHandler.class.getName());
 
-    // --- Member Variables ---
+    // (2) 性能基石: 线程安全的 ConcurrentHashMap
     private Map<String, String> myMap;
-    private final ReentrantLock dataLock = new ReentrantLock(); // Step 5: Java Lock
+
+    // (3) 优化: 此锁 *仅* 用于控制平面 (ZK事件, 状态转移, 备节点写入)
+    // Get 和 Put (主节点) 的热路径是 *无锁* 的
+    private final Lock controlLock = new ReentrantLock();
 
     // --- ZK & Server Info ---
     private CuratorFramework curClient;
-    private String zkNode; // The parent znode
+    private String zkNode;
     private String host;
     private int port;
-    private String myZnodePath; // This server's full ZK path
+    private String myZnodePath;
 
     // --- Role & State Variables ---
-    private volatile boolean isPrimary = false;
-    private volatile boolean dataInitialized = false; // 用于 Scenario #1 状态转移
+    private volatile boolean isPrimary = false; // (4) Volatile 保证可见性
+    private volatile boolean dataInitialized = false;
 
-    // --- (FIX) 持久化的备节点连接 ---
-    private volatile String backupAddress = null; // "host:port" of backup
-    private KeyValueService.Client backupClient = null; // 持久化的 Thrift 客户端
-    private TTransport backupTransport = null;       // 对应的 Transport
-
+    // --- (5) Volatile 保证连接对 Put 线程可见 ---
+    private volatile String backupAddress = null;
+    private volatile KeyValueService.Client backupClient = null;
+    private TTransport backupTransport = null;
+    private Socket backupSocket = null; // (6) 使用高级 Socket 调优
 
 
     public KeyValueHandler(String host, int port, CuratorFramework curClient, String zkNode) {
@@ -57,56 +62,50 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
         this.port = port;
         this.curClient = curClient;
         this.zkNode = zkNode;
-        myMap = new ConcurrentHashMap<String, String>();
+        // (7) 优化: 设置初始容量和并发级别 (基于您的代码)
+        this.myMap = new ConcurrentHashMap<>(1 << 15, 0.75f,
+                Math.max(2, Runtime.getRuntime().availableProcessors()));
     }
 
-    /**
-     * 由 StorageNode 调用，设置此服务器的 znode 路径
-     */
     public void setMyZnodePath(String path) {
         this.myZnodePath = path;
     }
 
-    /**
-     * 由 StorageNode 在 znode 创建后调用
-     */
     public void initialize() {
         // log.info("Handler initialized. My znode is: " + myZnodePath);
-        // 第一次确定角色并设置 watch
         determineRole();
     }
 
     /**
      * 核心逻辑：确定角色 (Primary/Backup) 并设置 ZK Watch.
-     * 也在 process() 中被调用.
+     * 这是 "控制平面", 所以我们使用 'controlLock'.
      */
     private void determineRole() {
-        dataLock.lock(); // 锁定以安全地更改角色
+        controlLock.lock(); // (8) 锁定控制平面
         try {
-            // 关键: 每次都必须重新设置 watch!
             List<String> children = curClient.getChildren().usingWatcher(this).forPath(zkNode);
-            Collections.sort(children); // 按字典序排序
+            Collections.sort(children);
 
-            if (children.isEmpty() || myZnodePath == null || !children.contains(myZnodePath.substring(zkNode.length() + 1))) {
+            // 检查我们自己的 znode 是否仍然存在
+            String myChild = null;
+            if (myZnodePath != null && myZnodePath.startsWith(zkNode + "/")) {
+                myChild = myZnodePath.substring(zkNode.length() + 1);
+            }
+
+            if (children.isEmpty() || myChild == null || !children.contains(myChild)) {
                 // log.warn("My znode is not in children list or list is empty.");
                 isPrimary = false;
-                closeBackupConnection(); // (FIX) 清理旧的备节点连接
+                closeBackupConnection();
                 return;
             }
 
-            // 检查我是否是 Primary (列表中的第一个)
             String primaryZnodeName = children.get(0);
             String primaryFullPath = zkNode + "/" + primaryZnodeName;
-            boolean wasPrimary = isPrimary; // 跟踪角色变化
 
             if (myZnodePath.equals(primaryFullPath)) {
                 // --- 我是 Primary ---
                 isPrimary = true;
-                // if (!wasPrimary) {
-                //     // log.info("====== Transitioned to PRIMARY role ======");
-                // }
 
-                // (FIX) 查找并管理到 Backup 的持久连接
                 String newBackupAddress = null;
                 if (children.size() > 1) {
                     String backupZnodeName = children.get(1);
@@ -115,17 +114,15 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                         byte[] data = curClient.getData().forPath(backupFullPath);
                         newBackupAddress = new String(data);
                     } catch (Exception e) {
-                        // log.warn("Failed to get backup address, assuming no backup.", e);
                         newBackupAddress = null;
                     }
                 }
 
-                // 检查备节点是否已更改
-                if (newBackupAddress == null || !newBackupAddress.equals(this.backupAddress)) {
-                    // log.info("Backup changed (or removed). Old: " + this.backupAddress + ", New: " + newBackupAddress);
-                    closeBackupConnection(); // 清理旧连接
+                // (9) 管理持久连接
+                if (!Objects.equals(newBackupAddress, this.backupAddress)) {
+                    // log.info("Backup changed. Old: " + this.backupAddress + ", New: " + newBackupAddress);
+                    closeBackupConnection();
                     if (newBackupAddress != null) {
-                        // 创建并保存新连接
                         createBackupConnection(newBackupAddress);
                     }
                 }
@@ -133,33 +130,30 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             } else {
                 // --- 我是 Backup ---
                 isPrimary = false;
-                closeBackupConnection(); // (FIX) Backup 不需要备节点连接
+                closeBackupConnection(); // Backup 节点不需要出站连接
 
-                if (wasPrimary) {
-                    // log.info("====== Transitioned to BACKUP role ======");
-                }
-
-                // Step 6 / Scenario #1: 如果我是 Backup 且未初始化数据, 执行状态转移
+                // (10) 状态转移
                 if (!dataInitialized) {
                     try {
                         byte[] data = curClient.getData().forPath(primaryFullPath);
                         String primaryAddress = new String(data);
                         // log.info("Performing state transfer from primary at " + primaryAddress);
+
+                        // performStateTransfer 会在内部被 'determineRole' 的锁保护
                         performStateTransfer(primaryAddress);
-                        dataInitialized = true; // 标记为已初始化
+                        dataInitialized = true;
                     } catch (Exception e) {
                         // log.error("Failed to perform initial state transfer", e);
-                        // 将保持未初始化状态，下次 watch 触发时重试
+                        // 保持 uninitialized, 下次 ZK 事件时重试
                     }
                 }
             }
-
         } catch (Exception e) {
             // log.error("Failed to determine role", e);
-            isPrimary = false; // 出错时, 假定为 backup
+            isPrimary = false;
             closeBackupConnection();
         } finally {
-            dataLock.unlock();
+            controlLock.unlock(); // (8) 释放控制平面锁
         }
     }
 
@@ -169,167 +163,201 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     @Override
     public void process(WatchedEvent event) throws Exception {
         // log.warn("ZooKeeper watch triggered: " + event.getType());
-
-        // Znode 列表发生变化 (服务器崩溃或加入)
-        // 重新运行角色确定逻辑
+        // ZK 事件是串行的; 它会调用 determineRole,
+        // determineRole 会获取 'controlLock'，从而安全地更新状态。
         determineRole();
     }
 
     // ========== KeyValueService.Iface (Thrift RPC) ==========
 
+    /**
+     * 读操作 (热路径)
+     * (11) 完全无锁
+     */
     @Override
     public String get(String key) throws org.apache.thrift.TException {
-        // Step 5: 检查角色 (Scenario #3) 读操作不应该上锁
-        if (!isPrimary) {
+        if (!isPrimary) { // 检查 volatile 变量
             // log.warn("Received GET request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve get requests.");
         }
+
+        // (12) CHM 的 getOrDefault 是线程安全的，无需加锁
         return myMap.getOrDefault(key, "");
     }
 
+    /**
+     * 写操作 (热路径)
+     * (13) 主路径无锁，但会阻塞等待同步复制
+     */
     @Override
     public void put(String key, String value) throws org.apache.thrift.TException {
-        // Step 5: 检查角色 (Scenario #3)
-        if (!isPrimary) {
+        if (!isPrimary) { // 检查 volatile 变量
             // log.warn("Received PUT request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve put requests.");
         }
-        // Step 5: Concurrency Control
-        dataLock.lock();
-        try {
-            // log.info("Primary: PUT " + key + "=" + value);
 
-            // (FIX) Step 5: 使用持久连接同步复制到 Backup
-            if (this.backupClient != null) {
-                // log.debug("Replicating PUT to backup: " + this.backupAddress);
-                try {
-                    // (FIX) 重用持久化的客户端
-                    this.backupClient.backupPut(key, value);
-                    // log.debug("Replication successful.");
+        // (14) 读取 volatile 变量以获取当前客户端
+        KeyValueService.Client c = this.backupClient;
 
-                } catch (TException e) {
-                    // log.warn("Replication to backup failed. Assuming backup is down.", e);
-                    // 复制失败. 假定 backup 已崩溃.
-                    // 清理坏的连接. 下次 ZK watch 触发时 'determineRole' 会找到新备节点.
-                    closeBackupConnection();
-                }
+        if (c != null) {
+            try {
+                // (15) 正确性: 先进行同步复制
+                c.backupPut(key, value);
+            } catch (TException e) {
+                // 复制失败. 假定 backup 已崩溃.
+                // log.warn("Replication to backup failed.", e);
+
+                // (16) 关键: *不要* 抛出异常给 A3Client.
+                // A3Client 的重试逻辑是基于 ZK watch 的, 不是基于 TException 的.
+                // 我们关闭坏的连接，并继续在“降级”模式下运行 (仅主节点).
+                // ZK watch 最终会触发，清理 znode，并允许新备节点加入。
+                closeBackupConnection();
+                // 注意: 我们 *故意* 继续执行，以便在本地写入
             }
-            // 先更新本地还是远程？！
-            // 复制完成 (或失败) 后, 更新本地 map
-            myMap.put(key, value);
+        }
 
+        // (17) 复制成功 (或没有备节点, 或备节点失败) 后, 在本地写入
+        // CHM 的 put 是线程安全的，无需加锁
+        myMap.put(key, value);
+
+        // (18) 此时向 A3Client 返回 "OK".
+        // 这满足了“同步复制”：数据要么在备节点上，要么备节点已被标记为死亡。
+    }
+
+    /**
+     * 备节点写入 (控制平面)
+     * (19) 必须加锁，以防止与 'performStateTransfer' 冲突
+     */
+    @Override
+    public void backupPut(String key, String value) throws TException {
+        controlLock.lock(); // (20) 锁定
+        try {
+            // log.info("Backup: Replicating PUT " + key + "=" + value);
+            myMap.put(key, value);
         } finally {
-            dataLock.unlock();
+            controlLock.unlock(); // (20) 解锁
         }
     }
 
     /**
-     * 新的 Thrift RPC (在 a3.thrift 中定义)
-     * 由 Primary 调用, 在 Backup 上执行.
-     */
-    @Override
-    public void backupPut(String key, String value) throws TException {
-        // 这个方法 *不* 检查 isPrimary
-        //dataLock.lock();
-        //try {
-        // log.info("Backup: Replicating PUT " + key + "=" + value);
-        myMap.put(key, value);
-        //} finally {
-        //    dataLock.unlock();
-        //}
-    }
-
-    /**
-     * 新的 Thrift RPC (在 a3.thrift 中定义)
-     * 由 Backup 调用, 在 Primary 上执行 (Scenario #1)
+     * 主节点提供快照 (热路径，但不频繁)
+     * (21) 完全无锁
      */
     @Override
     public Map<String, String> getFullDataSet() throws TException {
         if (!isPrimary) {
             // log.warn("Received getFullDataSet request, but I am not primary.");
-            // throw new TException("Not the primary. Cannot serve full data set.");
+            throw new TException("Not the primary. Cannot serve full data set.");
         }
 
-        dataLock.lock();
-        try {
-            // log.info("Primary: Serving full data set to new backup.");
-            // 返回一个 *副本* 以确保线程安全
-            // 返回新的map是否会增加开销？！
-            // return new HashMap<>(myMap);
-            return myMap;
-        } finally {
-            dataLock.unlock();
-        }
+        // (22) 正确性: 必须返回一个 *副本* (Snapshot).
+        // CHM 的构造函数是线程安全的，无需加锁。
+        return new HashMap<>(myMap);
     }
 
     // ========== 辅助方法 ==========
 
     /**
-     * (Scenario #1) Backup 从 Primary 拉取所有数据
+     * 备节点拉取数据 (控制平面)
+     * (23) 此方法由 'determineRole' 调用，因此已持有 'controlLock'
      */
     private void performStateTransfer(String primaryAddress) throws TException {
         KeyValueService.Client primaryClient = null;
         TTransport primaryTransport = null;
+        Socket socket = null;
         try {
-            // (FIX) 使用局部变量，因为这个连接只在状态转移时使用一次
             String[] parts = primaryAddress.split(":");
-            primaryTransport = new TFramedTransport(new TSocket(parts[0], Integer.parseInt(parts[1])));
-            primaryTransport.open();
+            String h = parts[0];
+            int p = Integer.parseInt(parts[1]);
+
+            // (24) 建立一个 *一次性* 连接 (使用您的高级 Socket 调优)
+            socket = new Socket();
+            socket.setTcpNoDelay(true);
+            socket.setKeepAlive(true);
+            socket.connect(new InetSocketAddress(h, p), 1000); // 1s connect timeout
+            socket.setSoTimeout(5000); // 5s read timeout (状态转移可能需要时间)
+
+            primaryTransport = new TFramedTransport(new TSocket(socket));
             TProtocol protocol = new TBinaryProtocol(primaryTransport);
             primaryClient = new KeyValueService.Client(protocol);
 
-            // 调用在 a3.thrift 中新定义的 'getFullDataSet'
-            myMap = primaryClient.getFullDataSet(); // FIX: 声明局部变量 'data'
+            // 调用 getFullDataSet (无锁)
+            Map<String, String> data = primaryClient.getFullDataSet();
 
-            // 已持有 dataLock (在 determineRole 中)
+            // (25) 正确性: 必须复制到 *现有的* CHM 中
+            // 我们已持有 'controlLock'，因此此操作是原子的 (不会与 backupPut 冲突)
             // log.info("State transfer: Received " + data.size() + " items from primary.");
-
-            // FIX: 覆盖 myMap 的内容以完成状态转移
-            //myMap.clear();
-            //myMap.putAll(data);
-
+            myMap.clear();
+            myMap.putAll(data);
             // log.info("State transfer complete.");
 
+        } catch (IOException e) {
+            throw new TException(e); // 转换为 TException
         } finally {
             if (primaryTransport != null) {
                 primaryTransport.close();
+            }
+            if (socket != null) {
+                try { socket.close(); } catch (IOException ignore) {}
             }
         }
     }
 
     /**
-     * (FIX) 创建一个到备节点的持久 Thrift 客户端连接
+     * (控制平面) 创建持久连接
+     * (26) 此方法由 'determineRole' 调用，因此已持有 'controlLock'
      */
     private void createBackupConnection(String hostPort) {
         try {
             String[] parts = hostPort.split(":");
-            String host = parts[0];
-            int port = Integer.parseInt(parts[1]);
+            String h = parts[0];
+            int p = Integer.parseInt(parts[1]);
 
-            this.backupTransport = new TFramedTransport(new TSocket(host, port));
-            this.backupTransport.open();
+            // (27) 使用您的高级 Socket 调优
+            this.backupSocket = new Socket();
+            this.backupSocket.setTcpNoDelay(true); // 禁用 Nagle 算法 (!! 性能关键)
+            this.backupSocket.setKeepAlive(true); // 保持 TCP 连接
+
+            // (28) 缓冲区大小 (可能需要调优)
+            // this.backupSocket.setSendBufferSize(1 << 16);
+            // this.backupSocket.setReceiveBufferSize(1 << 16);
+
+            // (29) 设置短连接和读超时，以便快速失败
+            this.backupSocket.connect(new InetSocketAddress(h, p), 300); // 300ms 连接超时
+            this.backupSocket.setSoTimeout(300); // 300ms 读超时
+
+            this.backupTransport = new TFramedTransport(new TSocket(this.backupSocket));
             TProtocol protocol = new TBinaryProtocol(this.backupTransport);
             this.backupClient = new KeyValueService.Client(protocol);
-            this.backupAddress = hostPort; // 存储当前连接的地址
+            this.backupAddress = hostPort; // 标记连接为活动
             // log.info("Created persistent connection to backup at " + hostPort);
-        } catch (TException e) {
+        } catch (Exception e) {
             // log.warn("Failed to create persistent connection to backup: " + e.getMessage());
-            this.backupClient = null;
-            this.backupTransport = null;
-            this.backupAddress = null;
+            closeBackupConnection(); // 确保清理
         }
     }
 
     /**
-     * (FIX) 关闭并清理到备节点的持久连接
+     * (控制平面) 关闭持久连接
+     * (30) 此方法由 'determineRole' 或 'put' (在 catch 块中) 调用
      */
     private void closeBackupConnection() {
+        // (31) 检查 backupClient 而不是 transport，以避免在 'put' 中重复关闭
+        if (this.backupClient == null) {
+            return;
+        }
+
+        // log.info("Closing persistent connection to backup at " + this.backupAddress);
+
         if (this.backupTransport != null) {
-            // log.info("Closing persistent connection to backup at " + this.backupAddress);
             this.backupTransport.close();
+        }
+        if (this.backupSocket != null) {
+            try { this.backupSocket.close(); } catch (IOException ignore) {}
         }
         this.backupClient = null;
         this.backupTransport = null;
+        this.backupSocket = null;
         this.backupAddress = null;
     }
 }
