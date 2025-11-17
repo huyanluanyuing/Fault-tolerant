@@ -16,21 +16,11 @@ import org.apache.curator.retry.*;
 import org.apache.curator.framework.*;
 import org.apache.curator.framework.api.CuratorWatcher;
 
-// import org.apache.log4j.*; // (如您所愿，注释掉日志以提高速度)
+import org.apache.log4j.*; // (如您所愿，注释掉日志以提高速度)
 
-/**
- * 最终版本: 满足正确性 (同步复制)
- * 并为性能 (无锁 Get/Put) 进行了优化
- * * 编译此文件前, 您必须:
- * 1. 打开 'a3.thrift'
- * 2. 在 'service KeyValueService' 中添加:
- * void backupPut(1:string key, 2:string value)
- * map<string, string> getFullDataSet()
- * 3. 运行 'thrift --gen java a3.thrift' 来重新生成 gen-java
- */
 public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
-    // static Logger log = Logger.getLogger(KeyValueHandler.class.getName());
+    static Logger log = Logger.getLogger(KeyValueHandler.class.getName());
 
     // (2) 性能基石: 线程安全的 ConcurrentHashMap
     private Map<String, String> myMap;
@@ -72,7 +62,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
     }
 
     public void initialize() {
-        // log.info("Handler initialized. My znode is: " + myZnodePath);
+        log.info("Handler initialized. My znode is: " + myZnodePath);
         determineRole();
     }
 
@@ -136,14 +126,15 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
                 if (!dataInitialized) {
                     try {
                         byte[] data = curClient.getData().forPath(primaryFullPath);
+                        log.info("Begin state transfer from primary at " );
                         String primaryAddress = new String(data);
-                        // log.info("Performing state transfer from primary at " + primaryAddress);
+                        log.info("Finishing Performing state transfer from primary at " + primaryAddress);
 
                         // performStateTransfer 会在内部被 'determineRole' 的锁保护
                         performStateTransfer(primaryAddress);
                         dataInitialized = true;
                     } catch (Exception e) {
-                        // log.error("Failed to perform initial state transfer", e);
+                        log.error("Failed to perform initial state transfer", e);
                         // 保持 uninitialized, 下次 ZK 事件时重试
                     }
                 }
@@ -180,9 +171,14 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             // log.warn("Received GET request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve get requests.");
         }
-
+        try {
+            // controlLock.lock();
+            return myMap.getOrDefault(key, "");
+        }finally {
+            // controlLock.unlock();
+        }
         // (12) CHM 的 getOrDefault 是线程安全的，无需加锁
-        return myMap.getOrDefault(key, "");
+
     }
 
     /**
@@ -191,11 +187,16 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
      */
     @Override
     public void put(String key, String value) throws org.apache.thrift.TException {
+        controlLock.lock();
         if (!isPrimary) { // 检查 volatile 变量
             // log.warn("Received PUT request, but I am not primary. Throwing exception.");
             throw new TException("Not the primary. Cannot serve put requests.");
         }
 
+
+        //controlLock.lock();
+
+        //controlLock.unlock();
         // (14) 读取 volatile 变量以获取当前客户端
         KeyValueService.Client c = this.backupClient;
 
@@ -203,23 +204,17 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             try {
                 // (15) 正确性: 先进行同步复制
                 c.backupPut(key, value);
-            } catch (TException e) {
-                // 复制失败. 假定 backup 已崩溃.
-                // log.warn("Replication to backup failed.", e);
 
-                // (16) 关键: *不要* 抛出异常给 A3Client.
-                // A3Client 的重试逻辑是基于 ZK watch 的, 不是基于 TException 的.
-                // 我们关闭坏的连接，并继续在“降级”模式下运行 (仅主节点).
-                // ZK watch 最终会触发，清理 znode，并允许新备节点加入。
+            } catch (TException e) {
+                log.warn("Replication to backup failed.", e);
                 closeBackupConnection();
-                // 注意: 我们 *故意* 继续执行，以便在本地写入
             }
         }
 
         // (17) 复制成功 (或没有备节点, 或备节点失败) 后, 在本地写入
         // CHM 的 put 是线程安全的，无需加锁
         myMap.put(key, value);
-
+        controlLock.unlock();
         // (18) 此时向 A3Client 返回 "OK".
         // 这满足了“同步复制”：数据要么在备节点上，要么备节点已被标记为死亡。
     }
@@ -252,7 +247,8 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
         // (22) 正确性: 必须返回一个 *副本* (Snapshot).
         // CHM 的构造函数是线程安全的，无需加锁。
-        return new HashMap<>(myMap);
+        return new ConcurrentHashMap<>(myMap);
+
     }
 
     // ========== 辅助方法 ==========
@@ -276,8 +272,8 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
             socket.setKeepAlive(true);
             socket.connect(new InetSocketAddress(h, p), 1000); // 1s connect timeout
             socket.setSoTimeout(5000); // 5s read timeout (状态转移可能需要时间)
-
-            primaryTransport = new TFramedTransport(new TSocket(socket));
+            int MAX_FRAME_SIZE = 50 * 1024 * 1024;
+            primaryTransport = new TFramedTransport(new TSocket(socket), MAX_FRAME_SIZE);
             TProtocol protocol = new TBinaryProtocol(primaryTransport);
             primaryClient = new KeyValueService.Client(protocol);
 
@@ -286,7 +282,7 @@ public class KeyValueHandler implements KeyValueService.Iface, CuratorWatcher {
 
             // (25) 正确性: 必须复制到 *现有的* CHM 中
             // 我们已持有 'controlLock'，因此此操作是原子的 (不会与 backupPut 冲突)
-            // log.info("State transfer: Received " + data.size() + " items from primary.");
+            log.info("State transfer: Received " + data.size() + " items from primary.");
             myMap.clear();
             myMap.putAll(data);
             // log.info("State transfer complete.");
